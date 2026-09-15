@@ -1,0 +1,8 @@
+﻿fastapi
+uvicorn[standard]
+python-dotenv
+pymupdf
+chromadb
+groq
+sentence-transformers
+python-multipart
