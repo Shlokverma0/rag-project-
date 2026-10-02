@@ -2,26 +2,27 @@ from backend.services.vector_store import collection
 from backend.services.embeddings import get_embeddings
 
 
-def retrieve_relevant_chunks(query: str, top_k: int = 3) -> dict:
-    """
-    Query leta hai, uska embedding banata hai, ChromaDB mein similarity search karta hai.
-    Top-k sabse relevant chunks return karta hai.
-    """
-    query_embedding = get_embeddings([query])[0]
+def retrieve_relevant_chunks(query: str, document_id: str, top_k: int = 5) -> dict:
+    """Search only the selected uploaded document and return its best-matching chunks."""
+    if not document_id:
+        return {"chunks": [], "distances": [], "metadatas": []}
 
+    matching = collection.get(
+        where={"document_id": document_id},
+        include=["metadatas"],
+    )
+    available = len(matching.get("ids", []))
+    if available == 0:
+        return {"chunks": [], "distances": [], "metadatas": []}
+
+    query_embedding = get_embeddings([query])[0]
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=top_k
+        n_results=min(max(1, top_k), available),
+        where={"document_id": document_id},
     )
 
-    # results ek dict hai jisme lists of lists hoti hain (batch support ke liye)
-    # Humne sirf 1 query bheji, isliye index [0] use karenge
-    chunks = results["documents"][0] if results["documents"] else []
-    distances = results["distances"][0] if results["distances"] else []
-    metadatas = results["metadatas"][0] if results["metadatas"] else []
-
-    return {
-        "chunks": chunks,
-        "distances": distances,
-        "metadatas": metadatas
-    }
+    chunks = (results.get("documents") or [[]])[0] or []
+    distances = (results.get("distances") or [[]])[0] or []
+    metadatas = (results.get("metadatas") or [[]])[0] or []
+    return {"chunks": chunks, "distances": distances, "metadatas": metadatas}

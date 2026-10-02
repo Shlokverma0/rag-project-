@@ -10,14 +10,14 @@ A small Retrieval-Augmented Generation (RAG) API that accepts text-based PDF fil
 PDF upload
    -> validate file type and size (20 MB maximum)
    -> extract text with PyMuPDF
-   -> split text into 500-character chunks with 50-character overlap
+   -> split text into boundary-aware chunks of about 1,000 characters with 150-character overlap
    -> create embeddings with all-MiniLM-L6-v2
    -> save chunks and embeddings in local ChromaDB
 
 Question
    -> embed the question
-   -> retrieve the top 3 matching chunks
-   -> check context distance; refine and retry when context looks weak
+   -> retrieve up to 5 matching chunks from the latest uploaded PDF
+   -> refine and retry if the answer model cannot find evidence
    -> ask Groq to answer from the retrieved context only
    -> return the answer, chunks, distances, and retry details
 ```
@@ -25,11 +25,12 @@ Question
 ## Features
 
 - PDF text extraction with PyMuPDF (`pymupdf`)
-- Character-based chunking with overlap
+- Boundary-aware chunking with overlap (about 1,000 characters per chunk)
 - Local sentence embeddings using `all-MiniLM-L6-v2`
 - Persistent vector storage with ChromaDB
 - Context-grounded responses through Groq (`openai/gpt-oss-20b`)
-- Basic retrieval retry and context sufficiency checks
+- Search automatically scoped to the latest uploaded PDF
+- One retry when the model cannot find an answer in the retrieved passages
 - Interactive API documentation through FastAPI / Swagger UI
 
 ## Technology
@@ -61,7 +62,7 @@ rag-project/
 │       ├── retriever.py         # Search for relevant chunks
 │       ├── rag_pipeline.py     # Retrieval, retries, prompt, and answer generation
 │       ├── planner.py           # Build a refined search query
-│       └── evaluator.py         # Decide whether retrieved context is sufficient
+│       └── evaluator.py         # Recognize when the answer model could not find evidence
 ├── requirements.txt
 ├── .env                         # Local secrets; do not commit
 └── README.md
@@ -138,7 +139,7 @@ Example response:
 {
   "filename": "rag-test-facts.pdf",
   "characters_extracted": 973,
-  "total_chunks": 3,
+  "total_chunks": 1,
   "total_chunks_in_db": 31,
   "message": "PDF processed and stored successfully!"
 }
@@ -162,12 +163,16 @@ Example response:
 {
   "question": "Which day is the library closed?",
   "answer": "The library is closed on Mondays.",
+  "filename": "rag-test-facts.pdf",
   "retrieved_chunks": ["Relevant document text..."],
-  "distances": [1.28]
+  "distances": [1.28],
+  "retries_used": 0,
+  "attempts": [{"attempt": 1, "query_used": "Which day is the library closed?", "chunks_found": 1}]
 }
 ```
 
-The endpoint returns the answer and the top 3 retrieved chunks with their ChromaDB distances. Lower distances indicate closer matches for the configured distance metric. The RAG pipeline tracks retry details internally, but the currently matched `/ask` route does not include those fields in its response.
+The endpoint returns the answer and up to 5 matching chunks with their ChromaDB distances, plus retry details. It automatically uses the latest uploaded PDF; you do not need to supply an ID. Retrieval does not use a fixed distance cutoff.
+
 ## Quick test in Swagger
 
 Use a text-based PDF. For a hands-on learning run, the synthetic `rag-test-facts.pdf` works well.
@@ -189,13 +194,13 @@ Use a text-based PDF. For a hands-on learning run, the synthetic `rag-test-facts
 6. Diagnose each result yourself:
 
    - Correct answer and a supporting chunk: upload, retrieval, and generation worked for that question.
-   - Supporting fact is in `retrieved_chunks`, but the answer is wrong or says it is missing: retrieval found evidence; inspect answer generation and the context-sufficiency/retry logic.
+   - Supporting fact is in `retrieved_chunks`, but the answer is wrong or says it is missing: retrieval found evidence; inspect answer generation and the prompt.
    - Supporting fact is absent from retrieved chunks: inspect extraction, chunking, embeddings, and retrieval.
-   - `total_chunks_in_db` is larger than `total_chunks`: ChromaDB contains chunks from earlier uploads too.
+   - `total_chunks_in_db` is larger than `total_chunks`: ChromaDB contains chunks from earlier uploads too, but default search is scoped to the latest one.
 
 7. Try an unrelated question, such as “What is Pinebrook's population?” The expected behavior is to say the document does not provide that fact. If it invents an answer, record it as a hallucination case.
-8. Try a `.txt` file with `/upload` and a blank question with `/ask`. Both should return a `400` validation error. A missing required field is normally reported as `422` by FastAPI.
-9. Restart the server and ask another question. Existing ChromaDB data persists, so old chunks remain searchable.
+8. Try a `.txt` file with `/upload` and a blank question with `/ask`. Both should return a `400` response for a rejected file and a `422` response for a blank question. A missing required field is normally reported as `422` by FastAPI.
+9. Restart the server, upload the PDF again, and ask another question. ChromaDB data persists; the newest upload becomes active.
 
 ### Answer key for the sample PDF
 
@@ -215,21 +220,22 @@ Use a text-based PDF. For a hands-on learning run, the synthetic `rag-test-facts
 ## Current limitations
 
 - Scanned/image-only PDFs need OCR; this project currently extracts embedded text only.
-- Chunks are stored persistently and retrieval searches the shared collection. There is no endpoint to delete a document or restrict a question to one uploaded filename.
-- Chunk IDs are based on filename and chunk index. Uploading the same filename again may conflict with IDs already in ChromaDB.
+- Chunks are stored persistently. There is no endpoint to delete an uploaded document.
+- Old chunks remain in ChromaDB and increase `total_chunks_in_db`; searches are filtered to the active document.
 - Retrieval and answer quality have not been formally evaluated. A relevant retrieved chunk does not guarantee that the LLM will always use it correctly.
 - The API has no authentication, rate limiting, or user-level data isolation; it is intended for local learning and experimentation.
-- Swagger reports a duplicate operation ID because `backend/main.py` registers `/ask` twice. The first matching route currently handles requests, so retry details computed by the pipeline are not included in the `/ask` response. Remove the duplicate registration and keep one handler.
-- The model context retrieved from your documents is sent to Groq to generate answers. Avoid uploading confidential data unless you have reviewed the provider and data-handling requirements for your use case.
+- The model context retrieved from your documents is sent to Groq to generate answers. Avoid uploading confidential data unless you have reviewed the provider's data-handling requirements for your use case.
 
 ## Troubleshooting
 
 - **`GROQ_API_KEY` error:** confirm `.env` is in the project root and contains a valid key; restart Uvicorn after changing it.
 - **Hugging Face Hub unauthenticated warning:** the public embedding model can still download, but requests may have lower rate limits. Configure `HF_TOKEN` if needed.
-- **Correct text appears in `retrieved_chunks`, but the answer says it cannot find it:** retrieval probably found context; inspect the RAG prompt, context sufficiency threshold, and generation response handling.
-- **Old documents appear in results:** ChromaDB persists under `backend/data/chroma_db` and all stored chunks are currently searched together. Back up the folder before manually clearing local vector data.
+- **Correct text appears in `retrieved_chunks`, but the answer says it cannot find it:** retrieval probably found context; inspect the RAG prompt and generation response handling.
+- **Old documents appear in results:** ChromaDB persists under `backend/data/chroma_db` and searches are filtered to the most recently uploaded document. Back up the folder before manually clearing local vector data.
 - **`fitz` deprecation warning:** use the supported PyMuPDF import form in the PDF loader (`import pymupdf as fitz`) and ensure `pymupdf` is installed in the active virtual environment.
 
 ## Author and License
 
 Created by **Shlok Verma**. Follow the project author on [GitHub](https://github.com/Shlokverma0).
+
+Copyright © 2026 Shlok Verma. No open-source license has been added yet.
